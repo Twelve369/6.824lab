@@ -1,7 +1,6 @@
 package mr
 
 import (
-	"fmt"
 	"log"
 	"sync"
 )
@@ -52,12 +51,10 @@ const (
 //
 // Your code here -- RPC handlers for the worker to call.
 // 给worker线程分配任务
-// 如果处于map阶段，在文件列表中选择一个还没有被map的文件,将文件名作为回复
-// 如果处于reduce阶段，将Key作为回复
-//
 func (c *Coordinator) DispatchTask(args *TaskArgs, reply *TaskReply) error {
 	mu.Lock()
 	defer mu.Unlock()
+	//var taskname string
 	switch c.WorkPhase {
 	case Mapping:
 		if len(c.MapChannel) > 0 {
@@ -65,18 +62,22 @@ func (c *Coordinator) DispatchTask(args *TaskArgs, reply *TaskReply) error {
 		} else {
 			reply.TType = WaitingType
 		}
+		//taskname = "map"
 	case Reducing:
 		if len(c.ReduceChannel) > 0 {
 			*reply = *<-c.ReduceChannel
 		} else {
 			reply.TType = WaitingType
 		}
+		//taskname = "reduce"
 	case Waiting:
 		reply.TType = WaitingType
+		//taskname = "waiting"
 	case AllFinish:
 		reply.TType = AllFinishType
+		//taskname = "all finish"
 	}
-	fmt.Println(*reply)
+	//fmt.Println(taskname, ":", *reply)
 	return nil
 }
 
@@ -203,6 +204,8 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
+	mu.Lock()
+	defer mu.Unlock()
 	if c.WorkPhase == AllFinish {
 		return true
 	} else {
@@ -229,6 +232,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	c.makeMapTask()
 	c.server()
-	fmt.Println("master is ready")
+	//fmt.Println("master is start")
 	return &c
 }

@@ -10,7 +10,9 @@ package main
 // Please do not change this file.
 //
 
-import "6.824/mr"
+import (
+	"6.824/mr"
+)
 import "plugin"
 import "os"
 import "fmt"
@@ -25,6 +27,14 @@ func main() {
 	mapf, reducef := loadPlugin(os.Args[1])
 
 	mr.Worker(mapf, reducef)
+
+	// debug使用
+	//var wg sync.WaitGroup
+	//for i := 0; i < 4; i++ {
+	//	wg.Add(1)
+	//	go mr.Worker(mapf, reducef, &wg)
+	//}
+	//wg.Wait()
 }
 
 //

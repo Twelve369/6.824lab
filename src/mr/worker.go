@@ -61,7 +61,7 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 //
 func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+	reducef func(string, []string) string /*wg *sync.WaitGroup*/) {
 	MapF = mapf
 	ReduceF = reducef
 
@@ -93,7 +93,9 @@ func Worker(mapf func(string, string) []KeyValue,
 				reply := ToNextReply{}
 				ok = call("Coordinator.ToNextPhase", &args, &reply)
 				if !ok {
-					log.Fatalln("rpc error")
+					//log.Fatalln("rpc error")
+					fmt.Println("cant connect rpc server")
+					workerState = finish // 当联系不到master时，可以假定master已经退出
 				}
 			}
 
@@ -105,6 +107,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			time.Sleep(time.Second)
 		}
 	}
+	//wg.Done()
 }
 
 // 向coordinator获取任务，然后执行
@@ -114,13 +117,13 @@ func askForTask() TaskReply {
 	ok := call("Coordinator.DispatchTask", &args, &reply)
 	if ok {
 		if reply.TType == MapType {
-			fmt.Printf("get map task, id is %d\n", reply.TaskId)
+			//fmt.Printf("get map task, id is %d\n", reply.TaskId)
 		} else if reply.TType == ReduceType {
-			fmt.Printf("get reduce task, id is %d\n", reply.TaskId)
+			//fmt.Printf("get reduce task, id is %d\n", reply.TaskId)
 		} else {
-			fmt.Printf("get other task\n")
+			//fmt.Printf("get other task\n")
 		}
-		fmt.Println("task:", reply)
+		//fmt.Println("task:", reply)
 	} else {
 		log.Fatalln("ask task error")
 	}
@@ -151,7 +154,7 @@ func doMapWork(task MapTask) bool {
 		processErr(err)
 		writefp.Close()
 	}
-	fmt.Printf("map task %d finish\n", task.TaskId)
+	//fmt.Printf("map task %d finish\n", task.TaskId)
 	return true
 }
 
@@ -165,15 +168,14 @@ func doReduceWork(task ReduceTask) bool {
 		if temp == nil {
 			break
 		}
-		//debug
-		fmt.Printf("reduce file %s\n", filename)
+
 		for i := 0; i < len(temp); i++ {
 			intermediate = append(intermediate, temp[i])
 		}
 		mapNum++
 	}
 	sort.Sort(MidKV(intermediate))
-	ofile, err := os.Create(fmt.Sprintf("mr-out-%d", reduceId))
+	ofile, err := os.Create(fmt.Sprintf("mr-out-%d", reduceId-1))
 	processErr(err)
 
 	for i := 0; i < len(intermediate); {
@@ -193,6 +195,8 @@ func doReduceWork(task ReduceTask) bool {
 		i = j
 	}
 	ofile.Close()
+	//debug
+	//fmt.Printf("reduce task finish, id is %d\n", task.TaskId)
 	return true
 }
 
