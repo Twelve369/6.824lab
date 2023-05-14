@@ -5,10 +5,10 @@ package main
 // in ../mr/coordinator.go
 //
 // go run mrcoordinator.go pg*.txt
+
 //
 // Please do not change this file.
 //
-
 import "6.824/mr"
 import "time"
 import "os"
@@ -20,7 +20,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	m := mr.MakeCoordinator(os.Args[1:], 10)
+	m := mr.MakeCoordinator(os.Args[1:], 2)
 	for m.Done() == false {
 		time.Sleep(time.Second)
 	}
