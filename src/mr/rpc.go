@@ -23,20 +23,24 @@ type ExampleReply struct {
 }
 
 // Coordinator.DispatchTask RPC参数
-type TaskArgs struct{}
+type TaskArgs struct {
+	WorkUid int
+}
 
 type TaskReply struct {
 	TType       TaskType
 	NumReduce   int
 	TaskId      int
 	MapFileName string
+	FileNum     int
 }
 
 // Coordinator.ToNextPhase RPC参数
 type ToNextArgs struct {
-	TType    TaskType
-	TaskId   int
-	IsFinish bool
+	TType     TaskType
+	TaskId    int
+	IsFinish  bool
+	workerPid int
 }
 type ToNextReply struct {
 }

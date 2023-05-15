@@ -27,8 +27,9 @@ type MapTask struct {
 }
 
 type ReduceTask struct {
-	TaskId    int
-	ReduceNum int
+	TaskId     int
+	ReduceNum  int
+	MapFileNum int
 }
 
 const (
@@ -76,7 +77,7 @@ func Worker(mapf func(string, string) []KeyValue,
 					ReduceNum: task.NumReduce,
 				}
 				ok := doMapWork(mTask)
-				args := ToNextArgs{TType: MapType, IsFinish: ok, TaskId: mTask.TaskId}
+				args := ToNextArgs{TType: MapType, IsFinish: ok, TaskId: mTask.TaskId, workerPid: os.Getpid()}
 				reply := ToNextReply{}
 				ok = call("Coordinator.ToNextPhase", &args, &reply)
 				if !ok {
@@ -86,10 +87,12 @@ func Worker(mapf func(string, string) []KeyValue,
 		case ReduceType:
 			{
 				rTask := ReduceTask{TaskId: task.TaskId,
-					ReduceNum: task.NumReduce,
+					ReduceNum:  task.NumReduce,
+					MapFileNum: task.FileNum,
 				}
+				// fmt.Println(rTask.MapFileNum)
 				ok := doReduceWork(rTask)
-				args := ToNextArgs{TType: ReduceType, IsFinish: ok, TaskId: rTask.TaskId}
+				args := ToNextArgs{TType: ReduceType, IsFinish: ok, TaskId: rTask.TaskId, workerPid: os.Getpid()}
 				reply := ToNextReply{}
 				ok = call("Coordinator.ToNextPhase", &args, &reply)
 				if !ok {
@@ -98,7 +101,6 @@ func Worker(mapf func(string, string) []KeyValue,
 					workerState = finish // 当联系不到master时，可以假定master已经退出
 				}
 			}
-
 		case WaitingType: //任务都被分发完了，worker进入等待状态
 			time.Sleep(time.Second)
 		case AllFinishType:
@@ -112,21 +114,9 @@ func Worker(mapf func(string, string) []KeyValue,
 
 // 向coordinator获取任务，然后执行
 func askForTask() TaskReply {
-	args := TaskArgs{}
+	args := TaskArgs{WorkUid: os.Getuid()}
 	reply := TaskReply{}
-	ok := call("Coordinator.DispatchTask", &args, &reply)
-	if ok {
-		if reply.TType == MapType {
-			//fmt.Printf("get map task, id is %d\n", reply.TaskId)
-		} else if reply.TType == ReduceType {
-			//fmt.Printf("get reduce task, id is %d\n", reply.TaskId)
-		} else {
-			//fmt.Printf("get other task\n")
-		}
-		//fmt.Println("task:", reply)
-	} else {
-		log.Fatalln("ask task error")
-	}
+	call("Coordinator.DispatchTask", &args, &reply)
 	return reply
 }
 
@@ -159,20 +149,17 @@ func doMapWork(task MapTask) bool {
 }
 
 func doReduceWork(task ReduceTask) bool {
-	mapNum := 1
 	reduceId := task.TaskId
 	intermediate := []KeyValue{}
-	for {
+	for mapNum := 1; mapNum <= task.MapFileNum; mapNum++ {
 		filename := fmt.Sprintf("mr-mid-%d-%d", mapNum, reduceId)
 		temp := openFileAndGetContent(filename)
 		if temp == nil {
-			break
+			continue
 		}
-
 		for i := 0; i < len(temp); i++ {
 			intermediate = append(intermediate, temp[i])
 		}
-		mapNum++
 	}
 	sort.Sort(MidKV(intermediate))
 	ofile, err := os.Create(fmt.Sprintf("mr-out-%d", reduceId-1))
@@ -240,7 +227,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	if err == nil {
 		return true
 	}
-	fmt.Println(err)
+	//fmt.Println(err)
 	return false
 }
 
