@@ -72,6 +72,7 @@ type Raft struct {
 	lastTickTime time.Time   // 上一次收到leader消息的时间
 	state        serverState // 当前server处于的状态 leader or follower or candidate
 	leaderId     int
+	voteNeed     int
 
 	commitIndex int // 已经被commit的日志条目的最大索引，开始是0，单调递增，不需要持久化
 	lastApplied int // 已经在状态机上运行了的日志条目的最大索引，开始是0，单调递增，不需要持久化
@@ -185,6 +186,8 @@ type RequestVoteReply struct {
 //
 // example RequestVote RPC handler.
 //
+// 分情况讨论
+// 1
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
@@ -200,8 +203,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		rf.currentTerm = args.Term
 		reply.VoteGranted = true
-		return
 	}
+	DPrintf("raft %d req vote %d %v, raft %d is now in term %d\n", args.CandidateId, rf.me, reply.VoteGranted, rf.me, reply.Term)
+	return
 }
 
 //
@@ -288,18 +292,24 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// Your code here to check if a leader election should be started and to randomize sleeping time using time.Sleep().
-		timeout := time.Duration(rand.Intn(300)+200) * time.Millisecond
+		rand.Seed(time.Now().UnixNano())
+		timeout := time.Duration(rand.Int63()%200+200) * time.Millisecond
+
+		// 睡眠这段时间，可能会收到leader的ticker消息，更新lastTickTime
 		time.Sleep(timeout)
 
+		// 开启新一轮选举的条件：1 选举时间到 2 处于追随者状态
 		rf.mu.Lock()
-		// 开启新一轮选举的条件：1 选举时间到 2 处于追随者状态 3 没有给别人投票
-		if time.Since(rf.lastTickTime) > timeout && rf.state == follower {
-			DPrintf("raft %d %v %v", rf.me, time.Since(rf.lastTickTime), timeout)
+		if time.Since(rf.lastTickTime) > timeout && rf.state == follower && rf.votedFor == -1 {
+			DPrintf("raft %d timeout %v %v", rf.me, time.Since(rf.lastTickTime), timeout)
 			rf.currentTerm++
 			rf.state = candidate
 			rf.votedFor = rf.me
 			voteCount := 1
-			DPrintf("raft %d start a new election in term %d\n", rf.me, rf.currentTerm)
+
+			thisTerm := rf.currentTerm
+
+			DPrintf("raft %d start a new election in term %d\n", rf.me, thisTerm)
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
 					continue
@@ -311,12 +321,15 @@ func (rf *Raft) ticker() {
 				reply := RequestVoteReply{}
 
 				rf.mu.Unlock()
-				rf.sendRequestVote(i, &args, &reply)
+				ok := rf.sendRequestVote(i, &args, &reply)
+				if ok == false {
+					DPrintf("raft %d req vote to %d, rpc error\n", rf.me, i)
+				}
 				rf.mu.Lock()
 
-				DPrintf("raft %d req vote %d %v\n", rf.me, i, reply.VoteGranted)
 				// 假设别的server选举周期更新
 				if reply.Term > rf.currentTerm {
+					DPrintf("raft %d req vote fail, term lower than %d\n", rf.me, reply.Term)
 					rf.currentTerm = reply.Term
 					rf.state = follower
 					rf.votedFor = -1
@@ -339,12 +352,12 @@ func (rf *Raft) ticker() {
 				rf.votedFor = -1
 				rf.leaderId = rf.me
 				rf.lastTickTime = time.Now()
-				DPrintf("raft %d become leader in term %d\n", rf.me, rf.currentTerm)
+				DPrintf("raft %d become leader in term %d\n", rf.me, thisTerm)
 			} else { //选举失败
 				rf.state = follower
 				rf.votedFor = -1
 				rf.lastTickTime = time.Now()
-				DPrintf("raft %d fail the election in term %d\n", rf.me, rf.currentTerm)
+				DPrintf("raft %d fail the election in term %d\n", rf.me, thisTerm)
 			}
 		}
 		rf.mu.Unlock()
@@ -373,8 +386,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.leaderId = -1
 	rf.currentTerm = 0
-
-	rand.Seed(time.Now().UnixNano())
+	if len(rf.peers)%2 == 1 {
+		rf.voteNeed = len(rf.peers)/2 + 1
+	} else {
+		rf.voteNeed = len(rf.peers) / 2
+	}
 
 	// Your initialization code here (2A, 2B, 2C)
 	go rf.sendTicker() // leader定期发送心跳
@@ -406,12 +422,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	reply.Success = false
-	// 心跳信息
+	// Leader发过来的心跳信息
 	if len(args.Entries) == 0 && args.Term >= rf.currentTerm {
 		rf.lastTickTime = time.Now()
 		rf.state = follower
 		rf.leaderId = args.LeaderId
 		rf.votedFor = -1
+		rf.currentTerm = args.Term
+		reply.Success = true
+		DPrintf("raft %d get ticker from %d in term %d\n", rf.me, args.LeaderId, args.Term)
 	} else {
 
 	}
@@ -422,6 +441,7 @@ func (rf *Raft) sendTicker() {
 	for rf.killed() == false {
 		rf.mu.Lock()
 		if rf.state == leader {
+			tickCount := 0
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
 					continue
@@ -432,6 +452,9 @@ func (rf *Raft) sendTicker() {
 				}
 				reply := AppendEntriesReply{}
 				rf.peers[i].Call("Raft.AppendEntries", &args, &reply)
+				if reply.Success {
+					tickCount++
+				}
 				// 如果接受到的回复选举期比当前节点更新，说明发生了新的选举，当前节点不再是leader
 				if reply.Term > rf.currentTerm {
 					rf.state = follower
@@ -440,7 +463,15 @@ func (rf *Raft) sendTicker() {
 					rf.currentTerm = reply.Term
 					rf.lastTickTime = time.Now()
 					DPrintf("leader %d transform to follower\n", rf.me)
+					break
 				}
+			}
+			if tickCount < rf.voteNeed {
+				rf.state = follower
+				rf.leaderId = -1
+				rf.votedFor = -1
+				rf.lastTickTime = time.Now()
+				DPrintf("leader %d transform to follower\n", rf.me)
 			}
 		}
 		rf.mu.Unlock()
