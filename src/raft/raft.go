@@ -70,14 +70,18 @@ type Raft struct {
 
 	// 非fig2规定的内容
 	lastTickTime time.Time   // 上一次收到leader消息的时间
+	electionTime time.Time   // 选举开始的时间
 	state        serverState // 当前server处于的状态 leader or follower or candidate
 	leaderId     int
 	voteNeed     int
+	voteAccess   int
+	voteCount    int
 
+	// for all servers
 	commitIndex int // 已经被commit的日志条目的最大索引，开始是0，单调递增，不需要持久化
 	lastApplied int // 已经在状态机上运行了的日志条目的最大索引，开始是0，单调递增，不需要持久化
 
-	// for leaders 在选举后需要重新初始化
+	// for leader 在选举后需要重新初始化
 	nextIndex  []int // 下一个发送到服务器的日志条目的索引，初始化为最后一个索引+1
 	matchIndex []int // 已知要在服务器上复制的最高日志条目的索引，开始为0，单调递增
 }
@@ -167,10 +171,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
+	Term        int
+	CandidateId int
+	// LastLogIndex int
+	// LastLogTerm  int
 }
 
 //
@@ -183,21 +187,19 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-//
-// example RequestVote RPC handler.
-//
-// 分情况讨论
-// 1
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
-	reply.VoteGranted = false
+
+	// 收到请求的server比candidate的term还要大
 	if rf.currentTerm > args.Term {
 		return
 	}
-	// voteFor可能已经失效
+
+	// 1 如果server没有给其他candidate投过票
+	// 2 voteFor失效，收到term更大的请求
 	if rf.votedFor == -1 || args.Term > rf.currentTerm {
 		rf.lastTickTime = time.Now()
 		rf.votedFor = args.CandidateId
@@ -236,9 +238,39 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, voteCount *int, voteAccess *int) {
+	DPrintf("[raft %d] [request vote from raft %d] [term %d]\n", args.CandidateId, server, args.Term)
+
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+
+	if !ok {
+		DPrintf("[raft %d] [request vote from raft %d] [fail by rpc error] [term %d]\n", args.CandidateId, server, args.Term)
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	*voteCount++
+	if reply.Term > rf.currentTerm {
+		rf.state = follower
+		rf.lastTickTime = time.Now()
+		rf.currentTerm = reply.Term
+		rf.votedFor = -1
+		return
+	}
+
+	if reply.VoteGranted == true {
+		*voteAccess++
+		DPrintf("[raft %d] [request vote from raft %d] [success] [term %d]\n", args.CandidateId, server, args.Term)
+		if *voteAccess == rf.voteNeed {
+			DPrintf("[raft %d] [election success] [term %d]\n", rf.me, rf.currentTerm)
+			rf.state = leader
+			rf.votedFor = -1
+		}
+	} else {
+		DPrintf("[raft %d] [request vote from raft %d] [fail] [term %d]\n", args.CandidateId, server, args.Term)
+	}
+
+	return
 }
 
 //
@@ -289,72 +321,72 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received heartsbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-		// 随机超时时间
-		timeout := time.Duration(rand.Int63()%200+200) * time.Millisecond
-		time.Sleep(timeout)
-		DPrintf("[raft %d] [wake up]\n", rf.me)
+
 		rf.mu.Lock()
-		if time.Since(rf.lastTickTime) > timeout && rf.state == follower && rf.votedFor == -1 {
-			rf.currentTerm++
-			rf.state = candidate
-			rf.votedFor = rf.me
-			voteCount := 1
-			thisTerm := rf.currentTerm
-
-			DPrintf("[raft %d] [start a new election] [term %d]\n", rf.me, thisTerm)
-			for i := 0; i < len(rf.peers); i++ {
-				if i == rf.me {
-					continue
-				}
-				args := RequestVoteArgs{
-					Term:        rf.currentTerm,
-					CandidateId: rf.me,
-				}
-				reply := RequestVoteReply{}
-
+		switch rf.state {
+		case follower:
+			{
 				rf.mu.Unlock()
-				ok := rf.sendRequestVote(i, &args, &reply)
-				if ok == false {
-					DPrintf("[raft %d] [req vote to raft %d] [fail] [rpc error] [term %d]\n", rf.me, i, thisTerm)
-				}
+				timeout := time.Duration(rand.Int63()%200+200) * time.Millisecond
+				time.Sleep(timeout)
 				rf.mu.Lock()
+				//DPrintf("[raft %d] [wake up] [term %d]\n", rf.me, rf.currentTerm)
+				if time.Since(rf.lastTickTime) > timeout {
+					rf.electionTime = time.Now()
+					rf.state = candidate
+					rf.currentTerm++
+					rf.votedFor = rf.me
+					rf.voteCount = 1
+					rf.voteAccess = 1
+					DPrintf("[raft-%d] [election start] [term-%d]\n", rf.me, rf.currentTerm)
+					for i := 0; i < len(rf.peers); i++ {
+						if i == rf.me {
+							continue
+						}
 
-				// 假设别的server选举周期更新
-				//if reply.Term > rf.currentTerm {
-				//	DPrintf("[raft %d] [req vote to raft %d] [fail] [low term]\n", rf.me, i)
-				//	rf.currentTerm = reply.Term
-				//	rf.state = follower
-				//	rf.votedFor = -1
-				//	break
-				//}
+						args := RequestVoteArgs{
+							Term:        rf.currentTerm,
+							CandidateId: rf.me,
+						}
+						reply := RequestVoteReply{}
 
-				if reply.VoteGranted {
-					DPrintf("[raft %d] [req vote to raft %d] [success]\n", rf.me, i)
-					voteCount++
-				} else {
-					DPrintf("[raft %d] [req vote to raft %d] [fail]\n", rf.me, i)
+						go rf.sendRequestVote(i, &args, &reply, &rf.voteCount, &rf.voteAccess)
+					}
 				}
 			}
-
-			// 选举成功
-			if voteCount >= rf.voteNeed {
-				rf.state = leader
-				rf.votedFor = -1
-				rf.leaderId = rf.me
-				DPrintf("[raft %d] [win election] [term %d]\n", rf.me, thisTerm)
-			} else { //选举失败
-				rf.state = follower
-				rf.votedFor = -1
-				DPrintf("[raft %d] [fail election] [term %d]\n", rf.me, thisTerm)
+		case candidate:
+			{
+				// 选举超时 或者 投票不满足
+				// 选举失败，候选人转为追随者
+				if time.Since(rf.electionTime) > 500*time.Millisecond || rf.voteCount == len(rf.peers) {
+					DPrintf("[raft-%d] [election fail] [term %d]", rf.me, rf.currentTerm)
+					rf.state = follower
+					rf.lastTickTime = time.Now()
+					rf.votedFor = -1
+				}
+			}
+		case leader:
+			{
+				for i := 0; i < len(rf.peers); i++ {
+					if i == rf.me {
+						continue
+					}
+					args := AppendEntriesArgs{
+						Term:     rf.currentTerm,
+						LeaderId: rf.me,
+					}
+					reply := AppendEntriesReply{}
+					go rf.sendAppendEntries(i, &args, &reply)
+				}
 			}
 		}
-		rf.lastTickTime = time.Now()
-		rf.mu.Unlock()
+		if rf.state == leader {
+			rf.mu.Unlock()
+			time.Sleep(100 * time.Millisecond)
+		} else {
+			rf.mu.Unlock()
+		}
 	}
-}
-
-func sleepForRandomTime(downTime, upTime int) {
-
 }
 
 //
@@ -374,20 +406,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+
+	// Your initialization code here (2A, 2B, 2C)
 	rf.state = follower
 	rf.lastTickTime = time.Now()
 	rf.votedFor = -1
 	rf.leaderId = -1
 	rf.currentTerm = 0
 	rand.Seed(int64(rf.me * 100)) // 根据节点编号设置随机数种子
-	if len(rf.peers)%2 == 1 {
-		rf.voteNeed = len(rf.peers)/2 + 1
-	} else {
-		rf.voteNeed = len(rf.peers) / 2
-	}
-
-	// Your initialization code here (2A, 2B, 2C)
-	go rf.sendTicker() // leader定期发送心跳
+	rf.voteNeed = len(rf.peers)/2 + 1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -415,70 +442,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
-	reply.Success = false
 	// Leader发过来的心跳信息
 	if len(args.Entries) == 0 && args.Term >= rf.currentTerm {
-		DPrintf("raft %d get ticker from raft %d in term %d\n", rf.me, args.LeaderId, args.Term)
+		DPrintf("[raft %d] [get ticker from raft %d] [term %d]\n", rf.me, args.LeaderId, args.Term)
 		rf.state = follower
-		rf.leaderId = args.LeaderId
 		rf.votedFor = -1
 		rf.currentTerm = args.Term
-		reply.Success = true
 		rf.lastTickTime = time.Now()
+
+		reply.Success = true
 	} else {
 
 	}
 	return
 }
 
-func (rf *Raft) sendTicker() {
-	for rf.killed() == false {
-		rf.mu.Lock()
-		if rf.state == leader {
-			tickCount := 0
-			for i := 0; i < len(rf.peers); i++ {
-				if i == rf.me {
-					rf.lastTickTime = time.Now()
-					continue
-				}
-				args := AppendEntriesArgs{
-					Term:     rf.currentTerm,
-					LeaderId: rf.me,
-				}
-				reply := AppendEntriesReply{}
-
-				rf.mu.Unlock()
-				ok := rf.peers[i].Call("Raft.AppendEntries", &args, &reply)
-				if ok == false {
-					DPrintf("raft %d send ticker fail\n", rf.me)
-				}
-				rf.mu.Lock()
-
-				if reply.Success {
-					tickCount++
-				}
-				// 如果接受到的回复选举期比当前节点更新，说明发生了新的选举，当前节点不再是leader
-				if reply.Term > rf.currentTerm {
-					rf.state = follower
-					rf.leaderId = -1
-					rf.votedFor = -1
-					rf.currentTerm = reply.Term
-					rf.lastTickTime = time.Now()
-					DPrintf("raft %d term is bigger, leader %d transform to follower\n", i, rf.me)
-					break
-				}
-			}
-			if tickCount < rf.voteNeed {
-				rf.state = follower
-				rf.leaderId = -1
-				rf.votedFor = -1
-				rf.lastTickTime = time.Now()
-				DPrintf("raft %d dont get enough ticker reply, transform to follower\n", rf.me)
-			}
-			rf.mu.Unlock()
-			time.Sleep(time.Millisecond * 100)
-			rf.mu.Lock()
-		}
-		rf.mu.Unlock()
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	for !ok {
+		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if reply.Term > rf.currentTerm {
+		rf.state = follower
+		rf.votedFor = -1
+		rf.lastTickTime = time.Now()
+		return
 	}
 }
