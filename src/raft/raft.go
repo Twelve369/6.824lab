@@ -209,14 +209,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
+		rf.state = follower
+		rf.votedFor = -1
+		rf.electionTimeout = time.Now()
 	}
 
 	if (rf.votedFor == args.CandidateId || rf.votedFor == -1) && ((args.LastLogTerm > rf.log[len(rf.log)-1].Term) || ((args.LastLogTerm == rf.log[len(rf.log)-1].Term) && args.LastLogIndex >= len(rf.log)-1)) {
 		reply.VoteGranted = true
-		rf.currentTerm = args.Term
-		rf.state = follower
 		rf.votedFor = args.CandidateId
-		rf.electionTimeout = time.Now()
 		return
 	}
 	DPrintf("raft %d dont vote, term %d, voteFor=%v, LastLogTerm=%v, local LastLogTerm=%v\n", rf.me, rf.currentTerm, rf.votedFor, args.LastLogTerm, rf.log[len(rf.log)-1].Term)
@@ -257,24 +257,25 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 
 	if !ok {
-		//DPrintf("[raft %d] [request vote from raft %d] [fail by rpc error] [term %d]\n", args.CandidateId, server, args.Term)
+		DPrintf("[raft %d] [request vote from raft %d] [fail by rpc error] [term %d]\n", args.CandidateId, server, args.Term)
 		return
 	}
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// 接受RPC的server比Term更大
-	if reply.Term > rf.currentTerm {
-		rf.state = follower
-		rf.electionTimeout = time.Now()
-		rf.currentTerm = reply.Term
-		rf.votedFor = -1
+	// 过期的投票申请
+	if rf.currentTerm != args.Term {
+		DPrintf("[raft %d] [currentTerm %v != args.term %v]\n", rf.me, rf.currentTerm, args.Term)
 		return
 	}
 
-	// 过期的投票申请
-	if rf.currentTerm != args.Term {
+	// 接受RPC的server比Term更大
+	if reply.Term > args.Term {
+		rf.state = follower
+		rf.currentTerm = reply.Term
+		rf.votedFor = -1
+		rf.electionTimeout = time.Now()
+		DPrintf("[raft %d] [reply.Term %v > rf.currentTerm %v]\n", rf.me, reply.Term, rf.currentTerm)
 		return
 	}
 
@@ -366,27 +367,25 @@ func (rf *Raft) checkAndApply() {
 
 // The ticker go routine starts a new election if this peer hasn't received heartsbeats recently.
 func (rf *Raft) ticker() {
-	skipWait := false
+	//skipWait := false
 	var timeout time.Duration
 	for rf.killed() == false {
 		rf.checkAndApply()
 		rf.mu.Lock()
 		if rf.state == follower {
 
-			if !skipWait {
-				rf.mu.Unlock()
-				timeout = time.Duration(rand.Int63()%300+200) * time.Millisecond
-				time.Sleep(timeout)
-				rf.mu.Lock()
-			}
-			skipWait = false
+			rf.mu.Unlock()
+			timeout = time.Duration(rand.Int63()%300+200) * time.Millisecond
+			time.Sleep(timeout)
+			rf.mu.Lock()
 
 			if time.Since(rf.electionTimeout) > timeout {
 				rf.state = candidate
 				rf.currentTerm++
 				rf.votedFor = rf.me
-				DPrintf("[raft-%d] [election start] [term-%d] [commit index %v]\n", rf.me, rf.currentTerm, rf.commitIndex)
 				voteAccess := 1
+
+				DPrintf("[raft-%d] [election start] [term-%d] [commit index %v]\n", rf.me, rf.currentTerm, rf.commitIndex)
 
 				for i := 0; i < len(rf.peers); i++ {
 					if i == rf.me {
@@ -410,17 +409,15 @@ func (rf *Raft) ticker() {
 			if time.Since(rf.electionTimeout) > 500*time.Millisecond {
 				rf.state = follower
 				rf.votedFor = -1
-				skipWait = true
 			}
 			rf.mu.Unlock()
 		} else if rf.state == leader {
-
+			// leader给所有follower发送心跳或者新日志
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
 					continue
 				}
 
-				// 如果有新的日志，复制到follower
 				if len(rf.log)-1 >= rf.nextIndex[i] {
 					args := AppendEntriesArgs{
 						Term:         rf.currentTerm,
@@ -515,11 +512,17 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
 	// Leader发过来的心跳信息
 	if args.Entries == nil {
 		if args.Term >= rf.currentTerm {
-			// 更新commit index
+			// 更新commitIndex
 			if args.LeaderCommit > rf.commitIndex {
 				rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log)-1)))
 			}
@@ -529,44 +532,58 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.currentTerm = args.Term
 			rf.electionTimeout = time.Now()
 
-			DPrintf("[raft %v] [get ticker from raft %v] [log len %v] [leader commit %v] [commitIndex %v]\n", rf.me, args.LeaderId, len(rf.log)-1, args.LeaderCommit, rf.commitIndex)
+			DPrintf("[raft %v] [get ticker from raft %v] [log %v] [leader commit %v] [local commit %v] [term %v]\n", rf.me, args.LeaderId, rf.log, args.LeaderCommit, rf.commitIndex, args.Term)
 		}
-		return
-	} else { // Leader发过来的日志
-		DPrintf("[raft %d] [get log from raft %d] [log entries %v] [term %v]\n", rf.me, args.LeaderId, args.Entries, args.Term)
-		// 判断是否是最新的Leader
-		if args.Term < rf.currentTerm {
-			reply.Term = rf.currentTerm
-			reply.Success = false
-			return
-		}
-
-		// 确认term和命令是否都相同,如果相同，按顺序将entries都复制到本地log中
+	} else /* Leader发过来的日志 */ {
+		// 确认PrevLogIndex上的LogTerm是否相同
 		if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
-			copyLog(&rf.log, args.PrevLogIndex+1, &args.Entries, 0)
+
+			// 复制Leader发过来的日志到本地
+			flag := false // 表示是否发生了覆盖（两个log内容不同时发生覆盖）
+			p1 := args.PrevLogIndex + 1
+			p2 := 0
+			for p1 < len(rf.log) && p2 < len(args.Entries) {
+				if rf.log[p1] != args.Entries[p2] {
+					flag = true
+					rf.log[p1] = args.Entries[p2]
+				}
+				p1++
+				p2++
+			}
+			if p1 < len(rf.log) && flag {
+				rf.log = rf.log[:p1]
+			}
+			for p2 < len(args.Entries) {
+				rf.log = append(rf.log, args.Entries[p2])
+				p2++
+			}
+
 			reply.Term = rf.currentTerm
 			reply.Success = true
-			DPrintf("[raft %d] [get log from leader id %d success] [log len %v]\n", rf.me, args.LeaderId, len(rf.log)-1)
+			DPrintf("[raft %v] [get log from raft %v success] [log %v] [log entries %v] [term %v]\n", rf.me, args.LeaderId, rf.log, args.Entries, args.Term)
 		} else {
 			reply.Term = rf.currentTerm
 			reply.Success = false
-			DPrintf("[raft %d] [get log from leader id %d failed] [log len %v]\n", rf.me, args.LeaderId, len(rf.log)-1)
+			DPrintf("[raft %v] [get log from raft %v failed] [log %v] [log entries %v] [term %v]\n", rf.me, args.LeaderId, rf.log, args.Entries, args.Term)
 		}
 		rf.state = follower
 		rf.votedFor = -1
 		rf.currentTerm = args.Term
 		rf.electionTimeout = time.Now()
-		return
 	}
 }
 
 func copyLog(dest *[]LogEntries, p1 int, src *[]LogEntries, p2 int) {
+	flag := false // 表示是否发生了覆盖（两个log内容不同时发生覆盖）
 	for p1 < len(*dest) && p2 < len(*src) {
-		(*dest)[p1] = (*src)[p2]
+		if (*dest)[p1] != (*src)[p2] {
+			flag = true
+			(*dest)[p1] = (*src)[p2]
+		}
 		p1++
 		p2++
 	}
-	if p1 < len(*dest) {
+	if p1 < len(*dest) && flag {
 		*dest = (*dest)[:p1]
 	}
 	for p2 < len(*src) {
@@ -577,44 +594,51 @@ func copyLog(dest *[]LogEntries, p1 int, src *[]LogEntries, p2 int) {
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	// 发生网络问题，导致RPC发送失败，重新发送
 	for !ok {
 		time.Sleep(10 * time.Millisecond)
 		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.Term != rf.currentTerm {
+
+	// 当前Leader是旧选期的，转换为follower
+	if reply.Term > args.Term {
+		rf.state = follower
+		rf.votedFor = -1
+		rf.currentTerm = reply.Term
+		rf.electionTimeout = time.Now()
 		return
 	}
-	// Log replica
+
+	// 发送心跳RPC后直接返回
 	if args.Entries != nil {
+		// RPC发送过程中，Leader状态已经发生改变
+		if args.Term != rf.currentTerm || len(rf.log)-1 <= rf.nextIndex[server]-1 {
+			return
+		}
+
 		if reply.Success {
 			rf.updateFollower(args, server)
 		} else {
-			DPrintf("[raft %d] [log replica to raft %d failed]\n", rf.me, server)
-			// 失败的原因
+			// 复制日志失败
 			// 1 先前的日志对不上
 			// 2 接受rpc的节点term比发送rpc的节点更大(Leader是旧的)
-			if reply.Term > args.Term {
-				DPrintf("[raft %d] [transform to follower]\n", rf.me)
-				rf.state = follower
-				rf.votedFor = -1
-				rf.currentTerm = reply.Term
-				rf.electionTimeout = time.Now()
-				return
-			}
+			DPrintf("[raft %d] [log replica to raft %d failed]\n", rf.me, server)
 
-			for rf.nextIndex[server] > 1 {
-				rf.nextIndex[server]--
+			for args.PrevLogIndex >= 0 {
+				args.PrevLogIndex--
 				newArgs := &AppendEntriesArgs{
 					Term:         args.Term,
 					LeaderId:     args.LeaderId,
 					LeaderCommit: args.LeaderCommit,
 				}
-				newReply := &AppendEntriesReply{}
-				newArgs.PrevLogIndex = rf.nextIndex[server] - 1
+				newArgs.PrevLogIndex = args.PrevLogIndex
 				newArgs.PrevLogTerm = rf.log[newArgs.PrevLogIndex].Term
 				newArgs.Entries = rf.log[newArgs.PrevLogIndex+1:]
+
+				newReply := &AppendEntriesReply{}
 
 				rf.mu.Unlock()
 				ok = rf.peers[server].Call("Raft.AppendEntries", newArgs, newReply)
@@ -624,14 +648,15 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 				}
 				rf.mu.Lock()
 
-				// 因为网络延迟，可能导致Term已经发生变化
+				// RPC发送过程中，Leader状态已经发生改变
 				if args.Term != rf.currentTerm {
 					return
 				}
 
+				// 成功收到新回复
 				if newReply.Success {
 					rf.updateFollower(newArgs, server)
-					break
+					return
 				} else if newReply.Term > args.Term {
 					rf.state = follower
 					rf.votedFor = -1
@@ -642,14 +667,23 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			}
 		}
 	}
+
 }
 
+// 需要持有锁的时候调用
 func (rf *Raft) updateFollower(args *AppendEntriesArgs, followerId int) {
-	rf.nextIndex[followerId] += len(args.Entries)
+	tmp := args.PrevLogIndex + len(args.Entries) + 1
+	if tmp > rf.nextIndex[followerId] {
+		rf.nextIndex[followerId] = tmp
+	}
 	rf.matchIndex[followerId] = rf.nextIndex[followerId] - 1
+	rf.logCommit(args.PrevLogIndex+1, len(args.Entries))
+}
 
-	curIndex := args.PrevLogIndex + 1
-	for i := 0; i < len(args.Entries); i++ {
+// 需要持有锁的时候调用
+func (rf *Raft) logCommit(index int, length int) {
+	curIndex := index
+	for i := 0; i < length; i++ {
 		if curIndex > rf.commitIndex {
 			count := 1
 			for j := 0; j < len(rf.matchIndex); j++ {
