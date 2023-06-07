@@ -367,7 +367,6 @@ func (rf *Raft) checkAndApply() {
 
 // The ticker go routine starts a new election if this peer hasn't received heartsbeats recently.
 func (rf *Raft) ticker() {
-	//skipWait := false
 	var timeout time.Duration
 	for rf.killed() == false {
 		rf.checkAndApply()
@@ -411,6 +410,7 @@ func (rf *Raft) ticker() {
 				rf.votedFor = -1
 			}
 			rf.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
 		} else if rf.state == leader {
 			// leader给所有follower发送心跳或者新日志
 			for i := 0; i < len(rf.peers); i++ {
@@ -615,7 +615,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	// 发送心跳RPC后直接返回
 	if args.Entries != nil {
 		// RPC发送过程中，Leader状态已经发生改变
-		if args.Term != rf.currentTerm || len(rf.log)-1 <= rf.nextIndex[server]-1 {
+		if args.Term != rf.currentTerm || len(rf.log)-1 < rf.nextIndex[server] {
 			return
 		}
 
@@ -649,7 +649,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 				rf.mu.Lock()
 
 				// RPC发送过程中，Leader状态已经发生改变
-				if args.Term != rf.currentTerm {
+				if args.Term != rf.currentTerm || len(rf.log)-1 < rf.nextIndex[server] {
 					return
 				}
 
