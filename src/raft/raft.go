@@ -107,11 +107,10 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	var term int
-	var isleader bool
-	// Your code here (2A).
+	var isLeader bool
 	term = rf.currentTerm
-	isleader = rf.state == leader
-	return term, isleader
+	isLeader = rf.state == leader
+	return term, isLeader
 }
 
 //
@@ -194,10 +193,20 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+// candidate发过来的投票申请，分情况讨论
+// 1.term比currentTerm小---直接拒绝
+// 2.如果Term大于currentTerm---更新本地Term，本机变为follower，但是不代表同意投票（发生网络分区，处于少量server的分区因为选不出Leader会进行多轮选举，因此Term比较大，不能选它们为leader因为日志没有更新提交）
+
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	if rf.killed() {
+		reply.Term = -1
+		reply.VoteGranted = false
+		return
+	}
 
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
@@ -214,12 +223,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.electionTimeout = time.Now()
 	}
 
-	if (rf.votedFor == args.CandidateId || rf.votedFor == -1) && ((args.LastLogTerm > rf.log[len(rf.log)-1].Term) || ((args.LastLogTerm == rf.log[len(rf.log)-1].Term) && args.LastLogIndex >= len(rf.log)-1)) {
+	if (rf.votedFor == args.CandidateId || rf.votedFor == -1) && (args.LastLogTerm > rf.log[len(rf.log)-1].Term || ((args.LastLogTerm == rf.log[len(rf.log)-1].Term) && args.LastLogIndex >= len(rf.log)-1)) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		return
 	}
-	DPrintf("raft %d dont vote, term %d, voteFor=%v, LastLogTerm=%v, local LastLogTerm=%v\n", rf.me, rf.currentTerm, rf.votedFor, args.LastLogTerm, rf.log[len(rf.log)-1].Term)
 	return
 }
 
@@ -254,18 +262,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, voteAccess *int) {
 	DPrintf("[raft %d] [request vote from raft %d] [term %d]\n", args.CandidateId, server, args.Term)
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 
-	if !ok {
-		DPrintf("[raft %d] [request vote from raft %d] [fail by rpc error] [term %d]\n", args.CandidateId, server, args.Term)
+	if rf.killed() {
 		return
 	}
+
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	if !ok {
+		return
+	}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	// 过期的投票申请
 	if rf.currentTerm != args.Term {
-		DPrintf("[raft %d] [currentTerm %v != args.term %v]\n", rf.me, rf.currentTerm, args.Term)
+		//DPrintf("[raft %d] [currentTerm %v != args.term %v]\n", rf.me, rf.currentTerm, args.Term)
 		return
 	}
 
@@ -275,7 +287,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
 		rf.electionTimeout = time.Now()
-		DPrintf("[raft %d] [reply.Term %v > rf.currentTerm %v]\n", rf.me, reply.Term, rf.currentTerm)
+		//DPrintf("[raft %d] [reply.Term %v > rf.currentTerm %v]\n", rf.me, reply.Term, rf.currentTerm)
 		return
 	}
 
@@ -285,9 +297,16 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		if *voteAccess == rf.voteNeed {
 			DPrintf("[raft %d] [election success] [term %d]\n", rf.me, rf.currentTerm)
 			rf.state = leader
+
+			// 将nextIndex初始化为log长度，会导致Leader认为部分 没有最新commit日志的server（因为网络分区没有收到新的日志） 拥有最新commit的日志
+			rf.nextIndex = make([]int, len(rf.peers))
+			for i := 0; i < len(rf.peers); i++ {
+				rf.nextIndex[i] = len(rf.log)
+			}
+			rf.matchIndex = make([]int, len(rf.peers))
 		}
 	} else {
-		DPrintf("[raft %d] [request vote from raft %d] [fail] [term %d]\n", args.CandidateId, server, args.Term)
+		//DPrintf("[raft %d] [request vote from raft %d] [fail] [term %d]\n", args.CandidateId, server, args.Term)
 	}
 
 	return
@@ -350,18 +369,21 @@ func (rf *Raft) killed() bool {
 
 // checkAndApply 将已经commit的log应用到状态机中
 func (rf *Raft) checkAndApply() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	for rf.commitIndex > rf.lastApplied {
-		rf.lastApplied++
-		msg := ApplyMsg{
-			Command:      rf.log[rf.lastApplied].Command,
-			CommandValid: true,
-			CommandIndex: rf.lastApplied,
+	for rf.killed() == false {
+		rf.mu.Lock()
+		for rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+			msg := ApplyMsg{
+				Command:      rf.log[rf.lastApplied].Command,
+				CommandValid: true,
+				CommandIndex: rf.lastApplied,
+			}
+			rf.mu.Unlock()
+			rf.applyChannel <- msg
+			rf.mu.Lock()
 		}
 		rf.mu.Unlock()
-		rf.applyChannel <- msg
-		rf.mu.Lock()
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -369,22 +391,20 @@ func (rf *Raft) checkAndApply() {
 func (rf *Raft) ticker() {
 	var timeout time.Duration
 	for rf.killed() == false {
-		rf.checkAndApply()
 		rf.mu.Lock()
-		if rf.state == follower {
 
+		if rf.state == follower {
 			rf.mu.Unlock()
 			timeout = time.Duration(rand.Int63()%300+200) * time.Millisecond
 			time.Sleep(timeout)
 			rf.mu.Lock()
-
 			if time.Since(rf.electionTimeout) > timeout {
 				rf.state = candidate
 				rf.currentTerm++
 				rf.votedFor = rf.me
 				voteAccess := 1
 
-				DPrintf("[raft-%d] [election start] [term-%d] [commit index %v]\n", rf.me, rf.currentTerm, rf.commitIndex)
+				DPrintf("[raft-%d] [election start] [term-%d]\n", rf.me, rf.currentTerm)
 
 				for i := 0; i < len(rf.peers); i++ {
 					if i == rf.me {
@@ -435,6 +455,8 @@ func (rf *Raft) ticker() {
 						LeaderId:     rf.me,
 						LeaderCommit: rf.commitIndex,
 						Entries:      nil,
+						PrevLogIndex: rf.nextIndex[i] - 1,
+						PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
 					}
 					reply := AppendEntriesReply{}
 					go rf.sendAppendEntries(i, &args, &reply)
@@ -492,6 +514,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.checkAndApply()
 	return rf
 }
 
@@ -507,11 +530,19 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // 接受者的currentTerm，方便leader更新自己
 	Success bool // 当follower包含的日志条目与prevLogIndex和prevLogTerm相匹配
+	XTerm   int  // 与leader发生冲突的log对应的Term
+	XIndex  int  // follower中term为XTerm的第一条log的index
+	XLen    int  // follower在对应位置没有log，XTerm返回-1，XLen返回空白的槽位数
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	if rf.killed() {
+		reply.Term = -1
+		reply.Success = false
+	}
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -519,25 +550,50 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	DPrintf("args.Term %v rf.currentTerm %v \n", args.Term, rf.currentTerm)
+
+	rf.state = follower
+	rf.votedFor = args.LeaderId
+	rf.currentTerm = args.Term
+	rf.electionTimeout = time.Now()
+
 	// Leader发过来的心跳信息
 	if args.Entries == nil {
-		if args.Term >= rf.currentTerm {
-			// 更新commitIndex
-			if args.LeaderCommit > rf.commitIndex {
-				rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log)-1)))
-			}
 
-			rf.state = follower
-			rf.votedFor = -1
-			rf.currentTerm = args.Term
-			rf.electionTimeout = time.Now()
-
-			DPrintf("[raft %v] [get ticker from raft %v] [log %v] [leader commit %v] [local commit %v] [term %v]\n", rf.me, args.LeaderId, rf.log, args.LeaderCommit, rf.commitIndex, args.Term)
+		// 更新commitIndex
+		if args.PrevLogIndex <= len(rf.log)-1 && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm && args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log)-1)))
 		}
-	} else /* Leader发过来的日志 */ {
-		// 确认PrevLogIndex上的LogTerm是否相同
-		if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
 
+		DPrintf("[raft %v] [get ticker from raft %v] [log %v] [leader commit %v] [local commit %v] [term %v]\n", rf.me, args.LeaderId, rf.log, args.LeaderCommit, rf.commitIndex, args.Term)
+		return
+
+	} else /* Leader发过来的日志 */ {
+		// 先判断PrevLogIndex上没有log
+		if args.PrevLogIndex >= len(rf.log) {
+			reply.Term = rf.currentTerm
+			reply.Success = false
+			reply.XTerm = -1
+			reply.XLen = args.PrevLogIndex - len(rf.log) + 1
+			DPrintf("[raft %v] [get log from raft %v failed] [log %v] [log entries %v] [term %v]\n", rf.me, args.LeaderId, rf.log, args.Entries, args.Term)
+			return
+		}
+
+		// 在判断PrevLogIndex位置上的log有没有冲突
+		if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+			reply.Term = rf.currentTerm
+			reply.Success = false
+			reply.XTerm = rf.log[args.PrevLogIndex].Term
+			idx := args.PrevLogIndex
+			for ; idx > 0; idx-- {
+				if rf.log[idx-1].Term != reply.XTerm {
+					break
+				}
+			}
+			reply.XIndex = idx
+			DPrintf("[raft %v] [get log from raft %v failed] [log %v] [log entries %v] [term %v]\n", rf.me, args.LeaderId, rf.log, args.Entries, args.Term)
+			return
+		} else {
 			// 复制Leader发过来的日志到本地
 			flag := false // 表示是否发生了覆盖（两个log内容不同时发生覆盖）
 			p1 := args.PrevLogIndex + 1
@@ -561,113 +617,103 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Term = rf.currentTerm
 			reply.Success = true
 			DPrintf("[raft %v] [get log from raft %v success] [log %v] [log entries %v] [term %v]\n", rf.me, args.LeaderId, rf.log, args.Entries, args.Term)
-		} else {
-			reply.Term = rf.currentTerm
-			reply.Success = false
-			DPrintf("[raft %v] [get log from raft %v failed] [log %v] [log entries %v] [term %v]\n", rf.me, args.LeaderId, rf.log, args.Entries, args.Term)
+			return
 		}
-		rf.state = follower
-		rf.votedFor = -1
-		rf.currentTerm = args.Term
-		rf.electionTimeout = time.Now()
-	}
-}
-
-func copyLog(dest *[]LogEntries, p1 int, src *[]LogEntries, p2 int) {
-	flag := false // 表示是否发生了覆盖（两个log内容不同时发生覆盖）
-	for p1 < len(*dest) && p2 < len(*src) {
-		if (*dest)[p1] != (*src)[p2] {
-			flag = true
-			(*dest)[p1] = (*src)[p2]
-		}
-		p1++
-		p2++
-	}
-	if p1 < len(*dest) && flag {
-		*dest = (*dest)[:p1]
-	}
-	for p2 < len(*src) {
-		*dest = append(*dest, (*src)[p2])
-		p2++
 	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	// 发生网络问题，导致RPC发送失败，重新发送
-	for !ok {
-		time.Sleep(10 * time.Millisecond)
-		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	}
+	for rf.killed() == false {
 
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+		ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+		// 发生网络问题，导致RPC发送失败，重新发送
+		for !ok {
+			if rf.killed() {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+			ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
+		}
 
-	// 当前Leader是旧选期的，转换为follower
-	if reply.Term > args.Term {
-		rf.state = follower
-		rf.votedFor = -1
-		rf.currentTerm = reply.Term
-		rf.electionTimeout = time.Now()
-		return
-	}
-
-	// 发送心跳RPC后直接返回
-	if args.Entries != nil {
-		// RPC发送过程中，Leader状态已经发生改变
-		if args.Term != rf.currentTerm || len(rf.log)-1 < rf.nextIndex[server] {
+		rf.mu.Lock()
+		// 当前Leader是旧选期的，转换为follower
+		if reply.Term > args.Term {
+			rf.state = follower
+			rf.votedFor = -1
+			rf.currentTerm = reply.Term
+			rf.electionTimeout = time.Now()
+			rf.mu.Unlock()
 			return
 		}
 
-		if reply.Success {
-			rf.updateFollower(args, server)
-		} else {
-			// 复制日志失败
-			// 1 先前的日志对不上
-			// 2 接受rpc的节点term比发送rpc的节点更大(Leader是旧的)
-			DPrintf("[raft %d] [log replica to raft %d failed]\n", rf.me, server)
+		// 心跳发过去了就算成功
+		if args.Entries == nil {
+			rf.mu.Unlock()
+			return
+		}
 
-			for args.PrevLogIndex >= 0 {
-				args.PrevLogIndex--
-				newArgs := &AppendEntriesArgs{
-					Term:         args.Term,
-					LeaderId:     args.LeaderId,
-					LeaderCommit: args.LeaderCommit,
+		// 发送心跳RPC后直接返回
+		if args.Entries != nil {
+			// RPC发送过程中，Leader状态已经发生改变
+			if args.Term != rf.currentTerm || len(rf.log)-1 < rf.nextIndex[server] {
+				rf.mu.Unlock()
+				return
+			}
+
+			if reply.Success == true {
+
+				tmp := args.PrevLogIndex + len(args.Entries) + 1
+				if tmp > rf.nextIndex[server] {
+					rf.nextIndex[server] = tmp
 				}
-				newArgs.PrevLogIndex = args.PrevLogIndex
-				newArgs.PrevLogTerm = rf.log[newArgs.PrevLogIndex].Term
-				newArgs.Entries = rf.log[newArgs.PrevLogIndex+1:]
-
-				newReply := &AppendEntriesReply{}
+				rf.matchIndex[server] = rf.nextIndex[server] - 1
+				rf.logCommit(args.PrevLogIndex+1, len(args.Entries))
 
 				rf.mu.Unlock()
-				ok = rf.peers[server].Call("Raft.AppendEntries", newArgs, newReply)
-				for !ok {
-					time.Sleep(10 * time.Millisecond)
-					ok = rf.peers[server].Call("Raft.AppendEntries", newArgs, newReply)
-				}
-				rf.mu.Lock()
+				return
+			} else {
+				// 根据XTerm和XLen直接回退一个Term的log
+				if reply.XTerm == -1 {
+					DPrintf("[raft %v] [get reply from %v] [term %v] [XTerm %v] [XIndex %v] [XLen %v] \n", rf.me, server, args.Term, reply.XTerm, reply.XIndex, reply.XLen)
 
-				// RPC发送过程中，Leader状态已经发生改变
-				if args.Term != rf.currentTerm || len(rf.log)-1 < rf.nextIndex[server] {
-					return
-				}
+					// 更新nextIndex
+					rf.nextIndex[server] = args.PrevLogIndex - reply.XLen + 1
 
-				// 成功收到新回复
-				if newReply.Success {
-					rf.updateFollower(newArgs, server)
-					return
-				} else if newReply.Term > args.Term {
-					rf.state = follower
-					rf.votedFor = -1
-					rf.currentTerm = reply.Term
-					rf.electionTimeout = time.Now()
-					return
+					newArgs := &AppendEntriesArgs{
+						Term:         args.Term,
+						LeaderId:     args.LeaderId,
+						LeaderCommit: args.LeaderCommit,
+						PrevLogIndex: args.PrevLogIndex - reply.XLen,
+						PrevLogTerm:  rf.log[args.PrevLogIndex-reply.XLen].Term,
+						Entries:      rf.log[args.PrevLogIndex-reply.XLen+1:],
+					}
+					newReply := &AppendEntriesReply{}
+
+					args = newArgs
+					reply = newReply
+				} else {
+					DPrintf("[raft %v] [get reply from %v] [term %v] [XTerm %v] [XIndex %v] [XLen %v] \n", rf.me, server, args.Term, reply.XTerm, reply.XIndex, reply.XLen)
+
+					// 更新nextIndex
+					rf.nextIndex[server] = reply.XIndex
+
+					newArgs := &AppendEntriesArgs{
+						Term:         args.Term,
+						LeaderId:     args.LeaderId,
+						LeaderCommit: args.LeaderCommit,
+						PrevLogIndex: reply.XIndex - 1,
+						PrevLogTerm:  rf.log[reply.XIndex-1].Term,
+						Entries:      rf.log[reply.XIndex:],
+					}
+					newReply := &AppendEntriesReply{}
+
+					args = newArgs
+					reply = newReply
 				}
 			}
 		}
+		rf.mu.Unlock()
 	}
-
 }
 
 // 需要持有锁的时候调用

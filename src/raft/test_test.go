@@ -63,26 +63,22 @@ func TestReElection2A(t *testing.T) {
 	cfg.disconnect(leader1)
 	cfg.checkOneLeader()
 
-	fmt.Printf("11111111111111111111111\n")
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader. and the old leader
 	// should switch to follower.
 	cfg.connect(leader1)
 	leader2 := cfg.checkOneLeader()
 
-	fmt.Printf("222222222222222222222222\n")
 	// if there's no quorum, no new leader should
 	// be elected.
 	cfg.disconnect(leader2)
 	cfg.disconnect((leader2 + 1) % servers)
 	time.Sleep(2 * RaftElectionTimeout)
 
-	fmt.Printf("3333333333333333333333333\n")
 	// check that the one connected server
 	// does not think it is the leader.
 	cfg.checkNoLeader()
 
-	fmt.Printf("444444444444444444444444444\n")
 	// if a quorum arises, it should elect a leader.
 	cfg.connect((leader2 + 1) % servers)
 	cfg.checkOneLeader()
@@ -132,6 +128,7 @@ func TestBasicAgree2B(t *testing.T) {
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
 
+	DPrintf("Test (2B): basic agreement\n")
 	cfg.begin("Test (2B): basic agreement")
 
 	iters := 3
@@ -158,6 +155,7 @@ func TestRPCBytes2B(t *testing.T) {
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
 
+	DPrintf("Test (2B): RPC byte count\n")
 	cfg.begin("Test (2B): RPC byte count")
 
 	cfg.one(99, servers, false)
@@ -280,6 +278,7 @@ func TestFailAgree2B(t *testing.T) {
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
 
+	DPrintf("Test (2B): agreement after follower reconnects\n")
 	cfg.begin("Test (2B): agreement after follower reconnects")
 
 	cfg.one(101, servers, false)
@@ -314,6 +313,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
 
+	DPrintf("Test (2B): no agreement if too many followers disconnect\n")
 	cfg.begin("Test (2B): no agreement if too many followers disconnect")
 
 	cfg.one(10, servers, false)
@@ -365,7 +365,8 @@ func TestConcurrentStarts2B(t *testing.T) {
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
 
-	cfg.begin("Test (2B): concurrent Start()s")
+	DPrintf("Test (2B): concurrent Start()\n")
+	cfg.begin("Test (2B): concurrent Start()")
 
 	var success bool
 loop:
@@ -466,6 +467,7 @@ func TestRejoin2B(t *testing.T) {
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
 
+	DPrintf("Test (2B): rejoin of partitioned leader\n")
 	cfg.begin("Test (2B): rejoin of partitioned leader")
 
 	cfg.one(101, servers, true)
@@ -504,6 +506,7 @@ func TestBackup2B(t *testing.T) {
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
 
+	DPrintf("Test (2B): leader backs up quickly over incorrect follower logs\n")
 	cfg.begin("Test (2B): leader backs up quickly over incorrect follower logs")
 
 	cfg.one(rand.Int(), servers, true)
@@ -576,6 +579,7 @@ func TestCount2B(t *testing.T) {
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
 
+	DPrintf("Test (2B): RPC counts aren't too high\n")
 	cfg.begin("Test (2B): RPC counts aren't too high")
 
 	rpcs := func() (n int) {

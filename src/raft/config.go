@@ -145,8 +145,6 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 			log.Printf("%v: log %v; server %v\n", i, cfg.logs[i], cfg.logs[j])
 			// some server has already committed a different value for this entry!
 
-			//DPrintf("%T %T\n", old, v)
-
 			err_msg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
 				m.CommandIndex, i, m.Command, j, old)
 		}
@@ -508,9 +506,6 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 		cfg.mu.Lock()
 		cmd1, ok := cfg.logs[i][index]
 		cfg.mu.Unlock()
-
-		//debug
-		//DPrintf("raft %d, cmd1 %v, ok %v\n", i, cmd1, ok)
 
 		if ok {
 			if count > 0 && cmd != cmd1 {
