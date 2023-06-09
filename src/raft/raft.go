@@ -448,6 +448,7 @@ func (rf *Raft) ticker() {
 						LeaderCommit: rf.commitIndex,
 					}
 					reply := AppendEntriesReply{}
+					DPrintf("[raft %v] [sent log to %v]\n", rf.me, i)
 					go rf.sendAppendEntries(i, &args, &reply)
 				} else {
 					args := AppendEntriesArgs{
@@ -459,6 +460,7 @@ func (rf *Raft) ticker() {
 						PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
 					}
 					reply := AppendEntriesReply{}
+					DPrintf("[raft %v] [sent ticker to %v]\n", rf.me, i)
 					go rf.sendAppendEntries(i, &args, &reply)
 				}
 			}
@@ -544,13 +546,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 	}
 
+	DPrintf("[raft %v] [args.Term %v] [rf.currentTerm %v] [args.LeaderId %v] \n", rf.me, args.Term, rf.currentTerm, args.LeaderId)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
-
-	DPrintf("args.Term %v rf.currentTerm %v \n", args.Term, rf.currentTerm)
 
 	rf.state = follower
 	rf.votedFor = args.LeaderId
@@ -636,6 +637,10 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		}
 
 		rf.mu.Lock()
+		if args.Term != rf.currentTerm {
+			
+		}
+
 		// 当前Leader是旧选期的，转换为follower
 		if reply.Term > args.Term {
 			rf.state = follower
